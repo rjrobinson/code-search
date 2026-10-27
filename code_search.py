@@ -319,14 +319,14 @@ def ranked_files(build_dir, query, k, weight):
 _cold = True  # no search has run in this process yet
 
 
-def log_usage(root, info, started, top_k, n_results):
+def log_usage(root, out, started, top_k):
     """One line per MCP search, for tracking use over time. Never the query text, and never fatal."""
     global _cold
     try:
         row = {
             "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "repo": slug(root),
-            "latency_ms": round((time.time() - started) * 1000), "cold": _cold, "top_k": top_k, "n_results": n_results,
-            "index_age_h": round((time.time() - info["built_at"]) / 3600, 2), "model": info["cfg"]["model"],
+            "latency_ms": round((time.time() - started) * 1000), "cold": _cold, "top_k": top_k, "n_results": out["n_results"],
+            "index_age_h": round((time.time() - out["built_at"]) / 3600, 2), "model": out["model"],
         }
         USAGE_LOG.parent.mkdir(parents=True, exist_ok=True)
         with open(USAGE_LOG, "a") as f:
@@ -336,12 +336,11 @@ def log_usage(root, info, started, top_k, n_results):
     _cold = False
 
 
-def search(path, query, top_k=8, path_prefix=None, log=False):
-    started = time.time()
+def render(path, query, top_k=8, path_prefix=None):
+    """Search the repo's current index and format the results: the part of a search that needs the
+    model, so a shared server can run it. The caller checks that the index exists."""
     root = main_repo(path)
     current = index_dir(root) / "current"
-    if not current.exists():
-        return f"No code-search index for {root}. Call code_index to build one."
     info = json.loads((current / "build.json").read_text())
     results = ranked_files(current, query, top_k * 4 if path_prefix else top_k, info["cfg"]["vector_weight"])
     if path_prefix:
@@ -352,8 +351,6 @@ def search(path, query, top_k=8, path_prefix=None, log=False):
         behind = "?"
     age_h = (time.time() - info["built_at"]) / 3600
     head = f"Index of {root.name} built {age_h:.1f} h ago at {info['head'][:9]} (this checkout has {behind} commits the index lacks). Paths are repo-relative."
-    if age_h >= STALE_HOURS:
-        head += "\n" + refresh_stale(root, age_h)
     blocks = []
     for i, r in enumerate(results, 1):
         m = r.metadata
@@ -362,9 +359,23 @@ def search(path, query, top_k=8, path_prefix=None, log=False):
         if text.startswith(f"# {m.get('file_path')}:"):  # chunk header repeats the line above
             text = text.split("\n", 1)[-1]
         blocks.append(f"### {i}. {where} {m.get('name', '')} (score {r.score:.3f})\n```\n{text}\n```")
+    body = "\n\n".join(blocks) if blocks else "No results."
+    return {"head": head, "body": body, "n_results": len(results), "built_at": info["built_at"], "model": info["cfg"]["model"]}
+
+
+def search(path, query, top_k=8, path_prefix=None, log=False):
+    started = time.time()
+    root = main_repo(path)
+    if not (index_dir(root) / "current").exists():
+        return f"No code-search index for {root}. Call code_index to build one."
+    out = render(path, query, top_k, path_prefix)
+    head = out["head"]
+    age_h = (time.time() - out["built_at"]) / 3600
+    if age_h >= STALE_HOURS:
+        head += "\n" + refresh_stale(root, age_h)
     if log:
-        log_usage(root, info, started, top_k, len(results))
-    return head + "\n\n" + ("\n\n".join(blocks) if blocks else "No results.")
+        log_usage(root, out, started, top_k)
+    return head + "\n\n" + out["body"]
 
 
 # --- eval ----------------------------------------------------------------------------------
