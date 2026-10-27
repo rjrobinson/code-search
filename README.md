@@ -300,7 +300,15 @@ Method:
 - Paired median tokens saved per question, by kind. These are 5 questions each, so treat them as rough: vocabulary mismatch about 89k, multi-file flow about 61k, concept about 34k.
 - These runs used in-process search, before the shared search server. Each session's first search loaded the model (median 4.6 s). Later searches in the same session took a median 135 ms, from only 2 such searches. Time results with the shared server are being re-measured.
 
-**In progress:** a comparison of Claude Code hook setups with code_search, and a re-measure of time with the shared search server.
+#### Hook kits
+
+We also measured [claude-code-lsp-enforcement-kit](https://github.com/nesaminua/claude-code-lsp-enforcement-kit), which blocks grep-style searches for code symbols in favor of LSP. With code_search on, in blocking mode it cost a median of about 29k tokens and one extra turn per question, with no accuracy gain. With the kit set to warn only (each block becomes a warning and the call runs), it cost nothing measurable compared with removing it.
+
+- 20 questions that every setup answered, one run each, paired medians.
+- Claude had the built-in LSP tool, but not the cclsp MCP server that some of the kit's suggestions name. Your setup may differ.
+- `bench/run_bench.py` has a `baseline_hooks` condition, so you can price your own hooks.
+
+**In progress:** a re-measure of time with the shared search server.
 
 ## Run the benchmark on your own repo
 
