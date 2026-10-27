@@ -189,8 +189,8 @@ The test repo is a large private Rails + TypeScript monorepo (about 15k files, 6
 
 | Setup | Right file in top 5 (of 20) | TypeScript (of 5) | MRR |
 |---|---|---|---|
-| Stock LEANN text chunks | 4 | not recorded | not recorded |
-| tree-sitter Ruby AST chunks | 7 | not recorded | not recorded |
+| Stock LEANN text chunks | 4 | 1 | 0.094 |
+| tree-sitter Ruby AST chunks | 7 | 0 | 0.191 |
 | Prism for Ruby, contriever | 12 | 0 | 0.304 |
 | Prism for Ruby, line windows for other code, Qwen3 with a query instruction (the default) | 17 | 4 | 0.655 |
 
