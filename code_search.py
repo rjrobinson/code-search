@@ -348,11 +348,11 @@ def log_usage(root, out, started, top_k, via, cold):
         print(f"code_search usage log failed: {e}", file=sys.stderr)
 
 
-def render(path, query, top_k=8, path_prefix=None):
-    """Search the repo's current index and format the results: the part of a search that needs the
-    model, so a shared server can run it. The caller checks that the index exists."""
+def render(path, current, query, top_k=8, path_prefix=None):
+    """Search an index (the session's <repo>/current) and format the results: the part of a search
+    that needs the model, so a shared server can run it. The caller resolves the index path, because
+    a shared server may have started with a different CODE_SEARCH_HOME."""
     root = main_repo(path)
-    current = index_dir(root) / "current"
     info = json.loads((current / "build.json").read_text())
     results = ranked_files(current, query, top_k * 4 if path_prefix else top_k, info["cfg"]["vector_weight"])
     if path_prefix:
@@ -380,13 +380,14 @@ def search(path, query, top_k=8, path_prefix=None, log=False):
     global _cold
     started = time.time()
     root = main_repo(path)
-    if not (index_dir(root) / "current").exists():
+    current = index_dir(root) / "current"
+    if not current.exists():
         return f"No code-search index for {root}. Call code_index to build one."
-    via_daemon = daemon_search(path, query, top_k, path_prefix)
+    via_daemon = daemon_search(path, current, query, top_k, path_prefix)
     if via_daemon:
         (out, cold), via = via_daemon, "daemon"
     else:
-        out, cold, via = render(path, query, top_k, path_prefix), _cold, "in-process"
+        out, cold, via = render(path, current, query, top_k, path_prefix), _cold, "in-process"
         _cold = False
     head = out["head"]
     age_h = (time.time() - out["built_at"]) / 3600
@@ -599,13 +600,13 @@ def ensure_daemon():
 _daemon_retry_at = 0.0
 
 
-def daemon_search(path, query, top_k, path_prefix):
+def daemon_search(path, current, query, top_k, path_prefix):
     """(render output, started the daemon) from the shared daemon, or None to search in-process: the
     daemon is off, the socket path is too long to bind, or the daemon failed in the last DAEMON_RETRY_S."""
     global _daemon_retry_at
     if not USE_DAEMON or time.time() < _daemon_retry_at or len(os.fsencode(SOCKET)) > 103:  # macOS sun_path limit
         return None
-    msg = {"op": "search", "repo_path": str(Path(path).resolve()), "query": query, "top_k": top_k, "path_prefix": path_prefix}
+    msg = {"op": "search", "repo_path": str(Path(path).resolve()), "index": str(current), "query": query, "top_k": top_k, "path_prefix": path_prefix}
     try:
         started = ensure_daemon()
         return daemon_request(msg, DAEMON_SEARCH_S), started
@@ -652,7 +653,7 @@ def daemon():
         if op == "search":
             t = time.time()
             with search_lock:
-                out = render(msg["repo_path"], msg["query"], int(msg.get("top_k", 8)), msg.get("path_prefix"))
+                out = render(msg["repo_path"], Path(msg["index"]), msg["query"], int(msg.get("top_k", 8)), msg.get("path_prefix"))
                 state["searches"] += 1
                 state["last_search"] = time.strftime("%Y-%m-%dT%H:%M:%S")
                 state["last_activity"] = time.time()
