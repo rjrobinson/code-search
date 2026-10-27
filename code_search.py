@@ -3,7 +3,8 @@
 One central index per repo under ~/.leann/repos/<slug>, keyed by the main checkout, so every
 worktree of a repo shares it. Ruby is chunked by Prism (chunk_ruby.rb); other code is chunked
 into line windows with a path header; Markdown uses LEANN's stock splitter. `serve` is a stdio
-MCP server; the other commands are for building and measuring indexes.
+MCP server; `daemon` is a shared search process that keeps the model warm for every session; the
+other commands are for building and measuring indexes.
 """
 
 import argparse
@@ -15,14 +16,22 @@ import json
 import os
 import re
 import shutil
+import socket
+import socketserver
 import subprocess
 import sys
+import threading
 import time
+import traceback
 from pathlib import Path
 
 HOME = Path.home()
-INDEX_ROOT = Path(os.environ.get("CODE_SEARCH_HOME", HOME / ".leann" / "repos"))
+INDEX_ROOT = Path(os.environ.get("CODE_SEARCH_HOME", HOME / ".leann" / "repos")).expanduser().absolute()  # the daemon runs from HOME
 USAGE_LOG = Path(os.environ.get("CODE_SEARCH_USAGE_LOG", HOME / ".leann" / "usage.jsonl"))
+SOCKET = Path(os.environ.get("CODE_SEARCH_SOCKET", HOME / ".leann" / "code-search.sock")).expanduser().absolute()
+DAEMON_LOCK = SOCKET.with_name(SOCKET.stem + ".daemon.lock")
+DAEMON_LOG = SOCKET.with_name("daemon.log")
+DAEMON_IDLE = int(os.environ.get("CODE_SEARCH_DAEMON_IDLE", 7200))  # seconds without a search before exit; 0 = never
 TOOL_DIR = Path(__file__).resolve().parent
 PYTHON = TOOL_DIR / ".venv" / "bin" / "python"
 CONFIG_FILE = TOOL_DIR / "config.json"
@@ -516,6 +525,128 @@ def serve():
             reply(msg_id, error={"code": -32601, "message": f"method not found: {method}"})
 
 
+# --- shared search daemon ------------------------------------------------------------------
+
+
+def daemon_log(msg):
+    print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} [{os.getpid()}] {msg}", file=sys.stderr, flush=True)
+
+
+def wait_lock(lock, seconds):
+    deadline = time.time() + seconds
+    while not try_lock(lock):
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.1)
+    return True
+
+
+def daemon_request(msg, timeout):
+    """One JSON-lines request to the daemon. Raises OSError when it is not reachable."""
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        s.settimeout(timeout)
+        s.connect(str(SOCKET))
+        s.sendall((json.dumps(msg) + "\n").encode())
+        line = s.makefile("rb").readline()
+    if not line:
+        raise ConnectionError("the daemon closed the connection")
+    reply = json.loads(line)
+    if "error" in reply:
+        raise RuntimeError(f"daemon: {reply['error']}")
+    return reply
+
+
+def daemon():
+    """One process that searches for every session, so the model loads once and stays warm.
+    Requests are JSON lines on SOCKET: ping, stats, and search (the fields of render)."""
+    import logging
+
+    logging.disable(logging.INFO)  # LEANN logs whole passages at INFO
+    SOCKET.parent.mkdir(parents=True, exist_ok=True)
+    lock = open(DAEMON_LOCK, "w")
+    if not wait_lock(lock, 5):  # a daemon at its idle exit can hold the lock for a moment
+        daemon_log("another daemon holds the lock; exiting")
+        return
+    SOCKET.unlink(missing_ok=True)  # only the lock holder gets here, so a socket file is stale
+    started = time.time()
+    state = {"searches": 0, "last_search": None, "last_activity": started}
+    search_lock = threading.Lock()  # LEANN searchers are not thread-safe
+
+    def stats():
+        rss = subprocess.run(["ps", "-o", "rss=", "-p", str(os.getpid())], capture_output=True, text=True).stdout.strip()
+        with search_lock:
+            loaded = [{"index": str(path), "build": target.name} for path, (target, _) in _searchers.items()]
+        return {
+            "pid": os.getpid(), "uptime_s": round(time.time() - started), "rss_mb": round(int(rss or 0) / 1024),
+            "indexes": loaded, "searches": state["searches"], "last_search": state["last_search"],
+            "idle_exit_s": DAEMON_IDLE, "socket": str(SOCKET),
+        }
+
+    def dispatch(msg):
+        op = msg.get("op")
+        if op == "ping":
+            return {"pid": os.getpid()}
+        if op == "stats":
+            return stats()
+        if op == "search":
+            t = time.time()
+            with search_lock:
+                out = render(msg["repo_path"], msg["query"], int(msg.get("top_k", 8)), msg.get("path_prefix"))
+                state["searches"] += 1
+                state["last_search"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+                state["last_activity"] = time.time()
+            out["ms"] = round((time.time() - t) * 1000)
+            daemon_log(f"search {Path(msg['repo_path']).name}: {out['n_results']} results in {out['ms']} ms")  # never the query
+            return out
+        return {"error": f"unknown op {op!r}"}
+
+    class Handler(socketserver.StreamRequestHandler):
+        timeout = 60  # a client that holds an idle connection must not block shutdown
+
+        def handle(self):
+            for line in self.rfile:
+                try:
+                    reply = dispatch(json.loads(line))
+                except Exception as e:  # a bad request must not take the daemon down
+                    daemon_log(f"request failed: {traceback.format_exc()}")
+                    reply = {"error": f"{type(e).__name__}: {e}"}
+                try:
+                    self.wfile.write((json.dumps(reply) + "\n").encode())
+                except OSError:
+                    return  # the client went away
+
+    old_umask = os.umask(0o177)  # the socket is created 0600, with no window at a looser mode
+    try:
+        server = socketserver.ThreadingUnixStreamServer(str(SOCKET), Handler)
+    finally:
+        os.umask(old_umask)
+
+    def idle_watch():
+        while True:
+            time.sleep(min(30, max(1, DAEMON_IDLE / 4)))
+            if not search_lock.locked() and time.time() - state["last_activity"] > DAEMON_IDLE:
+                daemon_log(f"no search for {DAEMON_IDLE} s; exiting")
+                server.shutdown()
+                return
+
+    if DAEMON_IDLE > 0:
+        threading.Thread(target=idle_watch, daemon=True).start()
+    daemon_log(f"listening on {SOCKET} (idle exit {DAEMON_IDLE or 'off'})")
+    try:
+        server.serve_forever()
+    finally:
+        SOCKET.unlink(missing_ok=True)  # new clients start a fresh daemon, which waits for the lock
+        server.server_close()  # waits for requests in flight
+        lock.close()
+
+
+def daemon_status():
+    try:
+        return json.dumps(daemon_request({"op": "stats"}, 5), indent=2)
+    except OSError:
+        return f"No search daemon on {SOCKET}."
+
+
 # --- cli -----------------------------------------------------------------------------------
 
 
@@ -546,10 +677,16 @@ def main():
     p.add_argument("--repo", default=".")
     p.add_argument("-k", type=int, default=8)
     sub.add_parser("serve")
+    sub.add_parser("daemon", help="serve searches for every session from one warm process")
+    sub.add_parser("status", help="show the search daemon's stats")
     a = ap.parse_args()
 
     if a.cmd == "serve":
         return serve()
+    if a.cmd == "daemon":
+        return daemon()
+    if a.cmd == "status":
+        return print(daemon_status())
     root = main_repo(Path(a.repo).resolve())
     if a.cmd == "index":
         print(json.dumps(index_repo(root, lock_fd=a.lock_fd), indent=2))
