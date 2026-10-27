@@ -32,6 +32,10 @@ SOCKET = Path(os.environ.get("CODE_SEARCH_SOCKET", HOME / ".leann" / "code-searc
 DAEMON_LOCK = SOCKET.with_name(SOCKET.stem + ".daemon.lock")
 DAEMON_LOG = SOCKET.with_name("daemon.log")
 DAEMON_IDLE = int(os.environ.get("CODE_SEARCH_DAEMON_IDLE", 7200))  # seconds without a search before exit; 0 = never
+USE_DAEMON = os.environ.get("CODE_SEARCH_DAEMON", "1") != "0"
+DAEMON_START_S = 30  # wait for a new daemon's first ping
+DAEMON_SEARCH_S = 60  # covers the daemon's first load of a large index
+DAEMON_RETRY_S = 300  # after the daemon fails to start or answer, search in-process this long
 TOOL_DIR = Path(__file__).resolve().parent
 PYTHON = TOOL_DIR / ".venv" / "bin" / "python"
 CONFIG_FILE = TOOL_DIR / "config.json"
@@ -325,24 +329,23 @@ def ranked_files(build_dir, query, k, weight):
     return results
 
 
-_cold = True  # no search has run in this process yet
+_cold = True  # no in-process search has loaded the model yet
 
 
-def log_usage(root, out, started, top_k):
-    """One line per MCP search, for tracking use over time. Never the query text, and never fatal."""
-    global _cold
+def log_usage(root, out, started, top_k, via, cold):
+    """One line per MCP search, for tracking use over time. Never the query text, and never fatal.
+    cold: the search had to start the daemon, or (in-process) load the model."""
     try:
         row = {
             "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "repo": slug(root),
-            "latency_ms": round((time.time() - started) * 1000), "cold": _cold, "top_k": top_k, "n_results": out["n_results"],
-            "index_age_h": round((time.time() - out["built_at"]) / 3600, 2), "model": out["model"],
+            "latency_ms": round((time.time() - started) * 1000), "cold": cold, "via": via, "top_k": top_k,
+            "n_results": out["n_results"], "index_age_h": round((time.time() - out["built_at"]) / 3600, 2), "model": out["model"],
         }
         USAGE_LOG.parent.mkdir(parents=True, exist_ok=True)
         with open(USAGE_LOG, "a") as f:
             f.write(json.dumps(row) + "\n")
     except Exception as e:
         print(f"code_search usage log failed: {e}", file=sys.stderr)
-    _cold = False
 
 
 def render(path, query, top_k=8, path_prefix=None):
@@ -373,17 +376,24 @@ def render(path, query, top_k=8, path_prefix=None):
 
 
 def search(path, query, top_k=8, path_prefix=None, log=False):
+    """Search through the shared daemon, or in this process when the daemon is off or failing."""
+    global _cold
     started = time.time()
     root = main_repo(path)
     if not (index_dir(root) / "current").exists():
         return f"No code-search index for {root}. Call code_index to build one."
-    out = render(path, query, top_k, path_prefix)
+    via_daemon = daemon_search(path, query, top_k, path_prefix)
+    if via_daemon:
+        (out, cold), via = via_daemon, "daemon"
+    else:
+        out, cold, via = render(path, query, top_k, path_prefix), _cold, "in-process"
+        _cold = False
     head = out["head"]
     age_h = (time.time() - out["built_at"]) / 3600
     if age_h >= STALE_HOURS:
         head += "\n" + refresh_stale(root, age_h)
     if log:
-        log_usage(root, out, started, top_k)
+        log_usage(root, out, started, top_k, via, cold)
     return head + "\n\n" + out["body"]
 
 
@@ -554,6 +564,50 @@ def daemon_request(msg, timeout):
     if "error" in reply:
         raise RuntimeError(f"daemon: {reply['error']}")
     return reply
+
+
+def ensure_daemon():
+    """Ping the daemon and start it if nothing answers. True when this call started it."""
+    try:
+        daemon_request({"op": "ping"}, 2)
+        return False
+    except OSError:
+        pass
+    SOCKET.parent.mkdir(parents=True, exist_ok=True)
+    with open(DAEMON_LOG, "a") as log:  # cwd HOME: the session's worktree may be deleted while the daemon runs
+        proc = subprocess.Popen([str(PYTHON), str(Path(__file__).resolve()), "daemon"], cwd=HOME,
+                                stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+    deadline = time.time() + DAEMON_START_S
+    while time.time() < deadline:
+        try:
+            daemon_request({"op": "ping"}, 2)
+            return True
+        except OSError:
+            if proc.poll() not in (None, 0):  # exit 0 means another session's daemon won the lock
+                raise ChildProcessError(f"the daemon exited with code {proc.returncode}; see {DAEMON_LOG}")
+            time.sleep(0.05)
+    raise TimeoutError(f"the daemon did not answer within {DAEMON_START_S} s; see {DAEMON_LOG}")
+
+
+_daemon_retry_at = 0.0
+
+
+def daemon_search(path, query, top_k, path_prefix):
+    """(render output, started the daemon) from the shared daemon, or None to search in-process: the
+    daemon is off, the socket path is too long to bind, or the daemon failed in the last DAEMON_RETRY_S."""
+    global _daemon_retry_at
+    if not USE_DAEMON or time.time() < _daemon_retry_at or len(os.fsencode(SOCKET)) > 103:  # macOS sun_path limit
+        return None
+    msg = {"op": "search", "repo_path": str(Path(path).resolve()), "query": query, "top_k": top_k, "path_prefix": path_prefix}
+    try:
+        started = ensure_daemon()
+        return daemon_request(msg, DAEMON_SEARCH_S), started
+    except RuntimeError as e:  # the daemon answered with an error; in-process reports it properly
+        print(f"code_search: daemon search failed, searching in-process: {e}", file=sys.stderr)
+    except Exception as e:  # unreachable, crashed or hung
+        print(f"code_search: daemon unavailable for {DAEMON_RETRY_S} s, searching in-process: {e}", file=sys.stderr)
+        _daemon_retry_at = time.time() + DAEMON_RETRY_S
+    return None
 
 
 def daemon():
