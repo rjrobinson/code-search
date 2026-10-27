@@ -7,6 +7,7 @@ MCP server; the other commands are for building and measuring indexes.
 """
 
 import argparse
+import collections
 import contextlib
 import fcntl
 import functools
@@ -288,18 +289,25 @@ def index_repo(root, overrides=None, lock_fd=None):
 
 # --- search --------------------------------------------------------------------------------
 
-_searchers = {}
+MAX_SEARCHERS = 4  # loaded indexes per process; the daemon serves several repos
+_searchers = collections.OrderedDict()  # index path as passed -> (resolved build dir, LeannSearcher)
 
 
-def searcher(build_dir):
+def searcher(path):
+    """LeannSearcher for an index path such as <repo>/current. A path whose target changed (a swapped
+    build) loads again, and past MAX_SEARCHERS the least recently used index is dropped."""
     from leann import LeannSearcher
 
-    build_dir = build_dir.resolve()
-    if build_dir not in _searchers:
-        _searchers.clear()  # a swapped-out build's embeddings are dead weight in memory
+    target = path.resolve()
+    if path in _searchers and _searchers[path][0] != target:
+        del _searchers[path]  # drop the swapped-out build before loading the new one
+    if path not in _searchers:
         with contextlib.redirect_stdout(sys.stderr):
-            _searchers[build_dir] = LeannSearcher(str(build_dir / "documents.leann"), recompute_embeddings=False, use_daemon=False)
-    return _searchers[build_dir]
+            _searchers[path] = (target, LeannSearcher(str(target / "documents.leann"), recompute_embeddings=False, use_daemon=False))
+    _searchers.move_to_end(path)
+    while len(_searchers) > MAX_SEARCHERS:
+        _searchers.popitem(last=False)
+    return _searchers[path][1]
 
 
 def ranked_files(build_dir, query, k, weight):
