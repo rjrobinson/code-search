@@ -6,11 +6,12 @@ code-search is a code-search layer built on [LEANN](https://github.com/StarTrail
 
 ## Why use it
 
+- **It wins where keyword search struggles.** On questions keyword search handles badly (product vocabulary, behaviors with no keyword, multi-file flows), Claude used 41% fewer tokens and 3 fewer turns with code_search, at the same accuracy. These are medians over 15 questions. See [Benchmarks](#benchmarks).
 - **It finds code by meaning.** Ask "where do we retry a failed webhook?" without knowing a class or method name.
-- **Fewer turns when Claude uses it.** In our benchmark, Claude called it in 19 of 35 sessions. On those 19 questions, sessions averaged about one fewer turn than without it (5.4 to 4.3), and the median cached context they re-read fell from 83k to 59k tokens. Across all 35 questions, median tokens fell 14%.
+- **It helps a little on easy questions too.** On 35 questions that grep handles well, Claude called it in 19 sessions. On those 19 questions, sessions averaged about one fewer turn than without it (5.4 to 4.3), and the median cached context they re-read fell from 83k to 59k tokens. Across all 35 questions, median tokens fell 14%.
 - **It is local and private.** No code leaves your machine.
 - **One index per repo.** Every worktree of the repo uses it, and it rebuilds itself in the background when it is a day old.
-- **It is fast once warm.** One search server, shared by every session, keeps the model loaded. While it runs, a search from any session takes about 0.1 s, including a new session's first search.
+- **It is fast once warm.** One search server, shared by every session, keeps the model loaded. While the server runs, a search takes about 0.1 s, including a new session's first search.
 
 ## When to use it, and when not
 
@@ -28,7 +29,7 @@ Skip it when:
 - **The repo is small.** grep is already fast.
 - **You have no Apple Silicon GPU.** The first build is slow on a CPU.
 - **RAM is tight.** The shared search server uses about 2.4 GB with the model and one large index loaded. It exits after 2 hours without a search.
-- **grep answers the question in one call.** Our question set was easy for grep. Per question, the median saving was about zero. On the 16 questions where Claude did not call the tool, the median session used about 1.8k more tokens.
+- **grep answers the question in one call.** On our easy question set, the median saving per question was about zero. On the 16 questions where Claude did not call the tool, the median session used about 1.8k more tokens.
 
 ## How it works
 
@@ -231,7 +232,7 @@ Environment variables (set them for the MCP server with `claude mcp add -e NAME=
 | [Prism](https://github.com/ruby/prism) for Ruby | Ruby's own parser. It gives one chunk per method, plus class-body chunks for Rails DSL calls (scopes, associations, callbacks). Each chunk starts with a header that holds the path, the line range and the qualified name, for example `# app/models/invoice.rb:6-9 Invoice#total_cents`. | Prism 1.9 parsed every indexed Ruby file in the test repo (about 6k) with 0 errors. Right file in the top 5, of 20 questions: stock text chunks 4, tree-sitter Ruby AST 7, Prism 12. |
 | Line windows with a `path:lines` header, for TypeScript, JavaScript and other code | LEANN 0.3.8's stock code splitter puts a line number in front of every line, so the embedding sees many number tokens. Line windows keep the code as written and put the path and line range in one header line. | Measured together with the Qwen3 step below, not on its own. |
 | [Qwen3-Embedding-0.6B](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) through sentence-transformers, with a query instruction | A small embedding model that handles code and takes an instruction for queries. | Against contriever with Prism, the right file in the top 5 went from 12 to 17 of 20, TypeScript from 0 to 4 of 5, and MRR from 0.304 to 0.655. This step also switched non-Ruby code to line windows, so the gain belongs to the combination. |
-| Stored embeddings, recompute off | LEANN can save disk by computing embeddings again at search time. We store them instead. Search then needs no embedding server and opens no port, so many sessions can search at once. | About 0.1 s per search after the model loads. The cost is disk, about 400 MB for a large repo, which is fine at repo scale. |
+| Stored embeddings, recompute off | LEANN can save disk by computing embeddings again at search time. We store them instead. Search then needs no LEANN embedding server and opens no network port, so many sessions can search at once. | About 0.1 s per search after the model loads. The cost is disk, about 400 MB for a large repo, which is fine at repo scale. |
 
 Two details about the model:
 
@@ -257,20 +258,49 @@ The test repo is a large private Rails + TypeScript monorepo (about 15k files, 6
 
 ### Claude Code end to end
 
-35 find-the-file questions. Headless Claude Code (`claude -p`) answered each question once without code_search and once with it. Both sessions had the same model, prompt and built-in tools. Other MCP servers, subagents and hooks were off.
+Method:
+
+- Headless Claude Code (`claude -p`), one session per question per setup.
+- Both setups had the same model, prompt and built-in tools. Other MCP servers, subagents and hooks were off.
+- The questions were frozen before any run.
+- Six answer-key corrections were found afterwards: extra accepted paths, each with a written reason. The frozen files stay unchanged, and the tables show raw and corrected scores side by side.
+- Raw top-3 accuracy was the same in both setups on both sets. Raw first-answer accuracy was the same on the hard set, and one lower with code_search on the easy set.
+- Each question ran once per setup, so treat small differences as noise.
+
+#### Easy set
+
+35 find-the-file questions.
 
 | | Without code_search | With code_search |
 |---|---|---|
 | Median tokens per question | 102,051 | 87,652 (14% fewer) |
+| Median turns | 4 | 4 |
 | Median time per question | 13.6 s | 12.7 s |
-| Right file in the top 3 answers | 34 of 35 | 34 of 35 |
-| Right file as the first answer | 34 of 35 | 33 of 35 |
+| Right file first, of 35 | 34 raw, 35 corrected | 33 raw, 35 corrected |
+| Right file in the top 3, of 35 | 34 raw, 35 corrected | 34 raw, 35 corrected |
 
-- Claude called the tool in 19 of 35 sessions. On those questions, it saved a median of about 22k tokens.
-- **These questions were easy for grep.** Without the tool, Claude found the right file for 34 of 35. Per question, the median saving was about zero. The 16 sessions that did not call the tool used a median of about 1.8k more tokens.
-- Each question ran once per condition, so treat small differences as noise.
+- Claude called the tool in 19 of 35 sessions (54%). On those questions, it saved a median of about 22k tokens.
+- **grep already wins these.** Without the tool, Claude found the right file for all 35 (corrected). Per question, the median saving was about zero. The 16 sessions that did not call the tool used a median of about 1.8k more tokens.
 - These runs came before the shared search server. Each session loaded the model for its first search.
-- **In progress:** a hard question set (vocabulary mismatch, concepts, multi-file flows).
+
+#### Hard set
+
+15 questions written to defeat keyword search: 5 vocabulary mismatch (product words that differ from code names), 5 concept (behaviors with no keyword), 5 multi-file flow.
+
+| | Without code_search | With code_search |
+|---|---|---|
+| Median tokens per question | 174,400 | 102,918 (41% fewer) |
+| Median turns | 8 | 5 |
+| Median time per question | 21.2 s | 19.5 s |
+| Right file first, of 15 | 11 raw, 14 corrected | 11 raw, 15 corrected |
+| Right file in the top 3, of 15 | 13 raw, 15 corrected | 13 raw, 15 corrected |
+
+- Per question, the paired median saving was 61,370 tokens. code_search used fewer tokens on 12 of 15 questions.
+- Claude called the tool in 13 of 15 sessions (87%).
+- Paired median tokens saved per question, by kind. These are 5 questions each, so treat them as rough: vocabulary mismatch about 89k, multi-file flow about 61k, concept about 34k.
+- These runs used in-process search, before the shared search server. Each session's first search loaded the model (median 4.6 s). Later searches in the same session took a median 135 ms, from only 2 such searches. Time results with the shared server are being re-measured.
+
+**In progress:** a comparison of Claude Code hook setups with code_search, and a re-measure of time with the shared search server.
 
 ## Run the benchmark on your own repo
 
