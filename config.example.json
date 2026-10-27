@@ -1,0 +1,21 @@
+{
+  "_docs": {
+    "_": "Optional. Copy to config.json next to code_search.py and keep only the keys you change. Keys that start with _ are ignored. These values are the built-in defaults. A change takes effect at the next index build.",
+    "model": "Hugging Face embedding model. Downloaded once to the Hugging Face cache.",
+    "mode": "LEANN embedding backend. sentence-transformers runs the model locally.",
+    "query_prompt": "Prefix added to search queries only, for instruction-tuned models such as Qwen3-Embedding. Set it to an empty string for models without one.",
+    "ruby": "Ruby chunker. prism: one chunk per method plus class-body chunks (needs Ruby 3.3+; without one, Ruby files fall back to line windows). text: LEANN's stock splitter. treesitter: LEANN's AST chunker, which needs an astchunk build with Ruby support.",
+    "other": "Chunker for non-Ruby code. lines: line windows with a path:line-range header. text: LEANN's stock splitter. Markdown always uses the stock splitter.",
+    "vector_weight": "Weight of vector similarity in LEANN's search score. 1.0 is pure vector search.",
+    "ruby_max_chars": "Max characters per chunk for Prism and line-window chunks. Longer methods are split into overlapping parts.",
+    "max_seq_length": "Max tokens embedded per chunk. Longer chunks are truncated. Lower values build faster and use less memory."
+  },
+  "model": "Qwen/Qwen3-Embedding-0.6B",
+  "mode": "sentence-transformers",
+  "query_prompt": "Instruct: Given a question about a codebase, retrieve the code that answers it\nQuery: ",
+  "ruby": "prism",
+  "other": "lines",
+  "vector_weight": 1.0,
+  "ruby_max_chars": 1500,
+  "max_seq_length": 512
+}

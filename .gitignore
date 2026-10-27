@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+.DS_Store
+config.json
+bench/runs/
+bench/history.jsonl
+eval/*.json
+!eval/example.json
