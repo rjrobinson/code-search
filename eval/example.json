@@ -1,0 +1,10 @@
+{
+  "repo": "your-org/your-repo",
+  "frozen_on": "YYYY-MM-DD",
+  "notes": "Placeholders. Replace them with questions about your own repo, and check each answer by hand before you freeze the file.",
+  "questions": [
+    {"lang": "rb", "q": "Where do we retry a failed outgoing webhook delivery?", "expect": ["app/workers/webhook_delivery_worker.rb"]},
+    {"lang": "ts", "q": "Which component renders the empty state when a list has no rows?", "expect": ["src/components/EmptyState.tsx", "src/components/List/EmptyList.tsx"]},
+    {"lang": "py", "q": "Where is the request rate limit for the public API configured?", "expect": ["api/middleware/rate_limit.py"]}
+  ]
+}
