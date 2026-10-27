@@ -542,12 +542,19 @@ def daemon_log(msg):
     print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} [{os.getpid()}] {msg}", file=sys.stderr, flush=True)
 
 
-def wait_lock(lock, seconds):
-    deadline = time.time() + seconds
+def take_daemon_lock(lock):
+    """True once this process holds the daemon lock. False as soon as another daemon answers a ping,
+    or if the lock is still held after 5 s. Waiting covers a daemon at its idle exit: it removes its
+    socket first and releases the lock a moment later."""
+    deadline = time.time() + 5
     while not try_lock(lock):
         if time.time() >= deadline:
             return False
-        time.sleep(0.1)
+        try:
+            daemon_request({"op": "ping"}, 1)
+            return False
+        except OSError:
+            time.sleep(0.1)
     return True
 
 
@@ -618,7 +625,7 @@ def daemon():
     logging.disable(logging.INFO)  # LEANN logs whole passages at INFO
     SOCKET.parent.mkdir(parents=True, exist_ok=True)
     lock = open(DAEMON_LOCK, "w")
-    if not wait_lock(lock, 5):  # a daemon at its idle exit can hold the lock for a moment
+    if not take_daemon_lock(lock):
         daemon_log("another daemon holds the lock; exiting")
         return
     SOCKET.unlink(missing_ok=True)  # only the lock holder gets here, so a socket file is stale
