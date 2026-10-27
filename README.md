@@ -10,7 +10,7 @@ code-search is a code-search layer built on [LEANN](https://github.com/StarTrail
 - **Fewer turns when Claude uses it.** In our benchmark, Claude called it in 19 of 35 sessions. On those 19 questions, sessions averaged about one fewer turn than without it (5.4 to 4.3), and the median cached context they re-read fell from 83k to 59k tokens. Across all 35 questions, median tokens fell 14%.
 - **It is local and private.** No code leaves your machine.
 - **One index per repo.** Every worktree of the repo uses it, and it rebuilds itself in the background when it is a day old.
-- **It is fast once warm.** After the model loads, a search takes about 0.1 s.
+- **It is fast once warm.** One search server, shared by every session, keeps the model loaded. While it runs, a search from any session takes about 0.1 s, including a new session's first search.
 
 ## When to use it, and when not
 
@@ -27,7 +27,7 @@ Skip it when:
 
 - **The repo is small.** grep is already fast.
 - **You have no Apple Silicon GPU.** The first build is slow on a CPU.
-- **RAM is tight.** Each session that searches holds about 3 GB. A server shared by all sessions is in progress.
+- **RAM is tight.** The shared search server uses about 2.4 GB with the model and one large index loaded. It exits after 2 hours without a search.
 - **grep answers the question in one call.** Our question set was easy for grep. Per question, the median saving was about zero. On the 16 questions where Claude did not call the tool, the median session used about 1.8k more tokens.
 
 ## How it works
@@ -90,6 +90,8 @@ To skip the permission prompt each time Claude searches, add these two rules to 
 
 It removes the MCP registration (only if it points at this checkout) and `.venv`. It does not delete your indexes or the downloaded model. It prints the commands to delete them.
 
+It does not stop a search server that is running. The server exits by itself after 2 hours without a search. To stop it now, run `code_search.py status` and kill the `pid` it shows. If you installed the launchd agent below, unload it first.
+
 ## Usage
 
 ### Build an index
@@ -135,6 +137,60 @@ A build always reads the main checkout's files, not the worktree's. The first li
 - Call `code_index` yourself after a large merge if you do not want to wait.
 - The last 2 builds are kept on disk. Older ones are deleted.
 
+### The search server
+
+Every Claude Code session starts its own MCP server, but that server does not load the model. It sends each search to one shared search server (`code_search.py daemon`), which holds the model and recently used indexes for all sessions.
+
+- **Start.** The first search that finds no server starts one in the background, then waits for it. That search takes a few seconds. Searches after it, from any session, take about 0.1 s.
+- **Indexes.** The server keeps up to 4 indexes loaded, one per repo, and drops the least recently used. When a rebuild replaces an index, the next search loads the new one. No restart is needed.
+- **Stop.** The server exits after 2 hours without a search (`CODE_SEARCH_DAEMON_IDLE`). The next search starts it again.
+- **Fallback.** If the server cannot start or fails, the session searches in its own process, as before, and tries the server again after 5 minutes. Search keeps working either way. Set `CODE_SEARCH_DAEMON=0` to always search in-process.
+- **Socket.** The server listens on a Unix socket at `~/.leann/code-search.sock`, readable only by you (mode 0600). Only one server runs at a time.
+- **Logs and status.** The log is `~/.leann/daemon.log`. To see the server's PID, uptime, memory, loaded indexes and search count:
+
+  ```bash
+  ~/code-search/.venv/bin/python ~/code-search/code_search.py status
+  ```
+
+- The shell `search` command uses the same server.
+- The server takes its environment from the session that started it. Set the environment variables below the same way for every session.
+
+#### Optional: keep the server warm all the time
+
+To skip even the first slow search, start the server at login with launchd. The installer does not do this. Save the file below as `~/Library/LaunchAgents/local.code-search.daemon.plist`. Replace `/Users/you/code-search` with your checkout and `/Users/you` with your home directory, because launchd does not expand `~`.
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>local.code-search.daemon</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/you/code-search/.venv/bin/python</string>
+    <string>/Users/you/code-search/code_search.py</string>
+    <string>daemon</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>CODE_SEARCH_DAEMON_IDLE</key><string>0</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key><false/>
+  </dict>
+  <key>StandardOutPath</key><string>/Users/you/.leann/daemon.log</string>
+  <key>StandardErrorPath</key><string>/Users/you/.leann/daemon.log</string>
+</dict>
+</plist>
+```
+
+- `CODE_SEARCH_DAEMON_IDLE=0` turns off the idle exit.
+- `KeepAlive` with `SuccessfulExit` false restarts the server after a crash. It does not restart it after a clean exit, for example when another server already runs.
+- The memory stays in use all day: about 2.2 GB with the model alone, and about 2.4 GB with one large index loaded.
+- Load it with `launchctl load ~/Library/LaunchAgents/local.code-search.daemon.plist`. Unload it with `launchctl unload` and the same path.
+
 ### Configuration
 
 The built-in defaults are the setup that won the benchmarks below, so you need no config file. To change something, copy `config.example.json` to `config.json` and keep only the keys you change. `config.example.json` documents each key. A change takes effect at the next build.
@@ -146,21 +202,25 @@ Environment variables (set them for the MCP server with `claude mcp add -e NAME=
 | `CODE_SEARCH_HOME` | `~/.leann/repos` | Where indexes live. |
 | `CODE_SEARCH_USAGE_LOG` | `~/.leann/usage.jsonl` | Local usage log. Set it to `/dev/null` to turn it off. |
 | `CODE_SEARCH_RUBY` | (search) | A Ruby 3.3+ binary to use for Prism. |
+| `CODE_SEARCH_DAEMON` | `1` | `0` turns off the shared search server. Each session then searches in its own process. |
+| `CODE_SEARCH_DAEMON_IDLE` | `7200` | Seconds without a search before the server exits. `0` means never. |
+| `CODE_SEARCH_SOCKET` | `~/.leann/code-search.sock` | The server's socket. The server's lock and log go in the same directory. The path must be 103 bytes or shorter. |
 
 ## Costs
 
 - **First build.** Build time grows with the number of chunks. A large repo (about 15k files, 60k chunks) takes about 27 min on an Apple Silicon GPU. A tiny repo takes under a minute, most of it loading the model. Each auto-refresh is a full rebuild in the background, with the same build time.
 - **Model download.** About 1.2 GB, once, into the Hugging Face cache.
-- **Memory.** Each Claude Code session starts its own search server. After its first search, a server uses about 3 GB of RAM for the model and the index. A server that has not searched yet uses little memory. A background build loads the model again while it runs.
+- **Memory.** One shared search server holds the model for every session. Its macOS memory footprint, which counts GPU memory, is about 2.2 GB with the model alone. A large index adds about 250 MB, and the server keeps up to 4 indexes. Each session's own MCP server uses about 15 MB. A background build loads the model again while it runs. With `CODE_SEARCH_DAEMON=0`, each session that searches holds its own copy, about 2.4 GB.
 - **Disk.** An index of a large repo is about 400 MB. With 2 builds kept, plan for about 800 MB per large repo.
-- **First search in a session.** It loads the model and the index, so it takes a few seconds (median 4.2 s in the benchmark). Later searches take about 0.1 s.
+- **First search.** Only the search that starts the server is slow, because it loads the model and the index: about 4 s for a tiny repo and 6 to 7 s for a large one. After that, a search from any session takes about 0.1 s, including a new session's first search, until the server exits after 2 idle hours.
 
 ## Privacy
 
 - Indexing and search run on your machine. No code is sent anywhere to build or search an index.
 - The only download is the embedding model, from Hugging Face, on the first build. When the model loads, the Hugging Face client can check huggingface.co for model updates. It does not send your code or queries. To stop all network access after the first download, set `HF_HUB_OFFLINE=1` for the server.
 - Search results go to Claude, the same as the output of a Read or grep.
-- The usage log records one line per search: time, repo, latency, whether it was the session's first search, `top_k`, result count, index age and model. It never records the query text. It stays on your machine.
+- The usage log records one line per search: time, repo, latency, whether the search had to start the search server (or, in-process, load the model), whether it ran in the server or in-process, `top_k`, result count, index age and model. It never records the query text. It stays on your machine.
+- The search server's log records the repo name, result count and time of each search. It never records the query text.
 
 ## Why this combination
 
@@ -208,7 +268,8 @@ The test repo is a large private Rails + TypeScript monorepo (about 15k files, 6
 - Claude called the tool in 19 of 35 sessions. On those questions, it saved a median of about 22k tokens.
 - **These questions were easy for grep.** Without the tool, Claude found the right file for 34 of 35. Per question, the median saving was about zero. The 16 sessions that did not call the tool used a median of about 1.8k more tokens.
 - Each question ran once per condition, so treat small differences as noise.
-- **In progress:** a hard question set (vocabulary mismatch, concepts, multi-file flows), and a warm server that all sessions share.
+- These runs came before the shared search server. Each session loaded the model for its first search.
+- **In progress:** a hard question set (vocabulary mismatch, concepts, multi-file flows).
 
 ## Run the benchmark on your own repo
 
@@ -274,7 +335,8 @@ If you use LEANN's AST chunking, do not use tree-sitter 0.26.0. Its Python bindi
 - **Ruby files are not chunked by method**: the build log says "no Ruby with Prism". Install Ruby 3.3+ and run `./install.sh` again to see if it is found. Or point the server at one: `claude mcp remove code-search -s user`, then `claude mcp add --scope user -e CODE_SEARCH_RUBY=/path/to/ruby code-search -- <checkout>/.venv/bin/python <checkout>/code_search.py serve`. Then call `code_index`.
 - **A build failed**: read `~/.leann/repos/<repo>/build.log`. Fix the cause, then call `code_index`.
 - **Results look old**: the index is built from the main checkout. Check the "commits the index lacks" count in the first line of the results, and call `code_index` to rebuild.
-- **High memory use**: each session with a search server uses about 3 GB after its first search. Close idle sessions.
+- **High memory use**: run `code_search.py status`. One search server should hold the model, at about 2.2 GB plus about 250 MB per large index. If sessions still use about 2.4 GB each, they are searching in-process: their lines in `~/.leann/usage.jsonl` say `"via": "in-process"`. Check that `CODE_SEARCH_DAEMON` is not `0`, and read `~/.leann/daemon.log`. To free the memory now, kill the server's `pid`. The next search starts it again.
+- **Every search is slow, or the first one fails over to in-process**: read `~/.leann/daemon.log`. After a failure, sessions search in-process for 5 minutes, then try the server again.
 
 ## Credits
 
