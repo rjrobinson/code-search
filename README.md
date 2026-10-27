@@ -2,9 +2,33 @@
 
 Semantic code search for Claude Code. It finds code by what the code does, not by what it is called. Everything runs on your machine.
 
-## Why
+code-search is a code-search layer built on [LEANN](https://github.com/StarTrail-org/LEANN) ([paper](https://arxiv.org/abs/2506.08276)). LEANN supplies the vector index, the builder and searcher API, and the pattern for serving search to Claude Code over MCP. This project adds code-aware chunking, a code-tuned embedding setup, one shared index per repo, auto-refresh and a benchmark harness.
 
-grep and LSP are fast and exact when you know a name. When you only know the behavior ("where do we retry a failed webhook?"), Claude has to guess names and search many times. code-search gives Claude one more tool, `code_search`, that ranks chunks of your repo by meaning. It does not replace grep or LSP. The tool description tells Claude to keep using them for exact symbols.
+## Why use it
+
+- **It finds code by meaning.** Ask "where do we retry a failed webhook?" without knowing a class or method name.
+- **Fewer turns when Claude uses it.** In our benchmark, Claude called it in 19 of 35 sessions. On those 19 questions, sessions averaged about one fewer turn than without it (5.4 to 4.3), and the median cached context they re-read fell from 83k to 59k tokens. Across all 35 questions, median tokens fell 14%.
+- **It is local and private.** No code leaves your machine.
+- **One index per repo.** Every worktree of the repo uses it, and it rebuilds itself in the background when it is a day old.
+- **It is fast once warm.** After the model loads, a search takes about 0.1 s.
+
+## When to use it, and when not
+
+| Kind of question | Best tool |
+|---|---|
+| Where is X handled? How does Y work? | `code_search` |
+| Product words that differ from code names (the UI says "workspace", the code says `organization`) | `code_search` |
+| Unfamiliar or large repo, onboarding | `code_search` |
+| Exact symbol: definition, references, callers | LSP |
+| Literal strings: error messages, config keys, log lines | `rg` or `grep` |
+| You already know the file | Read |
+
+Skip it when:
+
+- **The repo is small.** grep is already fast.
+- **You have no Apple Silicon GPU.** The first build is slow on a CPU.
+- **RAM is tight.** Each session that searches holds about 3 GB. A server shared by all sessions is in progress.
+- **grep answers the question in one call.** Our question set was easy for grep. Per question, the median saving was about zero. On the 16 questions where Claude did not call the tool, the median session used about 1.8k more tokens.
 
 ## How it works
 
@@ -28,12 +52,15 @@ The index skips `spec`, `test`, `tests`, `__tests__`, `__mocks__`, `vendor`, `no
 - [uv](https://docs.astral.sh/uv/getting-started/installation/). It installs Python 3.12 for you if you do not have it.
 - The [Claude Code CLI](https://code.claude.com/docs/en/setup) (`claude`).
 - git.
-- Optional: Ruby 3.3 or later, for Prism chunking of Ruby files. Without it, Ruby files get line-window chunks, which search less well. The tool looks for a Ruby with Prism in this order: `CODE_SEARCH_RUBY`, `ruby` on your PATH, then asdf, rbenv and mise installs (newest first), then Homebrew. Your repo can pin an older Ruby. The tool finds a newer one on its own.
+- Optional: Ruby 3.3 or later, for Prism chunking of Ruby files. Newer is better. On our test repo, Prism 1.9 (Ruby 4.0) parsed every indexed Ruby file with no errors, and Ruby 3.3's Prism 0.19 reported errors on 9 of them.
+  - The tool uses the first Ruby with Prism that it finds, in this order: `CODE_SEARCH_RUBY`, `ruby` on your PATH (with a version manager, that is the repo's pinned Ruby), asdf, rbenv and mise installs (newest first), then Homebrew.
+  - A pinned Ruby older than 3.3 has no Prism, so the tool skips it.
+  - Without any Ruby 3.3+, Ruby files get line-window chunks, which search less well.
 
 ## Install
 
 ```bash
-git clone <repo-url> ~/code-search
+git clone https://github.com/rjrobinson/code-search.git ~/code-search
 cd ~/code-search
 ./install.sh
 ```
@@ -77,7 +104,7 @@ The first build downloads the embedding model. The build log is at `~/.leann/rep
 
 ### Search
 
-Claude calls `code_search` on its own when it needs to find code by meaning. You can also ask for it: "use code_search to find where we send the weekly digest email". The tool takes:
+Claude calls `code_search` on its own when it needs to find code by meaning. You can also ask for it: "use code_search to find where we resize uploaded images". The tool takes:
 
 | Argument | Meaning |
 |---|---|
@@ -126,7 +153,7 @@ Environment variables (set them for the MCP server with `claude mcp add -e NAME=
 - **Model download.** About 1.2 GB, once, into the Hugging Face cache.
 - **Memory.** Each Claude Code session starts its own search server. After its first search, a server uses about 3 GB of RAM for the model and the index. A server that has not searched yet uses little memory. A background build loads the model again while it runs.
 - **Disk.** An index of a large repo is about 400 MB. With 2 builds kept, plan for about 800 MB per large repo.
-- **First search in a session.** It loads the model and the index, so it takes a few seconds (median 4.2 s in the benchmark). Later searches are fast.
+- **First search in a session.** It loads the model and the index, so it takes a few seconds (median 4.2 s in the benchmark). Later searches take about 0.1 s.
 
 ## Privacy
 
@@ -135,22 +162,53 @@ Environment variables (set them for the MCP server with `claude mcp add -e NAME=
 - Search results go to Claude, the same as the output of a Read or grep.
 - The usage log records one line per search: time, repo, latency, whether it was the session's first search, `top_k`, result count, index age and model. It never records the query text. It stays on your machine.
 
-## Benchmark results
+## Why this combination
 
-On 35 find-the-file questions in a large Rails and TypeScript monorepo, headless Claude Code ran each question once without code_search and once with it. Same model, prompt and built-in tools.
+| Piece | Why | Evidence |
+|---|---|---|
+| [LEANN](https://github.com/StarTrail-org/LEANN) | Local, small and MIT. Its builder and searcher API takes our own chunks and metadata, so the chunking is ours and the index is LEANN's. | The index of the test repo is about 400 MB. |
+| [Prism](https://github.com/ruby/prism) for Ruby | Ruby's own parser. It gives one chunk per method, plus class-body chunks for Rails DSL calls (scopes, associations, callbacks). Each chunk starts with a header that holds the path, the line range and the qualified name, for example `# app/models/invoice.rb:6-9 Invoice#total_cents`. | Prism 1.9 parsed every indexed Ruby file in the test repo (about 6k) with 0 errors. Right file in the top 5, of 20 questions: stock text chunks 4, tree-sitter Ruby AST 7, Prism 12. |
+| Line windows with a `path:lines` header, for TypeScript, JavaScript and other code | LEANN 0.3.8's stock code splitter puts a line number in front of every line, so the embedding sees many number tokens. Line windows keep the code as written and put the path and line range in one header line. | Measured together with the Qwen3 step below, not on its own. |
+| [Qwen3-Embedding-0.6B](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) through sentence-transformers, with a query instruction | A small embedding model that handles code and takes an instruction for queries. | Against contriever with Prism, the right file in the top 5 went from 12 to 17 of 20, TypeScript from 0 to 4 of 5, and MRR from 0.304 to 0.655. This step also switched non-Ruby code to line windows, so the gain belongs to the combination. |
+| Stored embeddings, recompute off | LEANN can save disk by computing embeddings again at search time. We store them instead. Search then needs no embedding server and opens no port, so many sessions can search at once. | About 0.1 s per search after the model loads. The cost is disk, about 400 MB for a large repo, which is fine at repo scale. |
+
+Two details about the model:
+
+- **Why not MLX.** LEANN 0.3.8's MLX path runs a language model and mean-pools its output over padded tokens with no attention mask. sentence-transformers applies the pooling the model was trained with.
+- **Why a 512-token cap.** Most chunks are 1,500 characters or less, but one very long line (minified or generated code) makes a much larger chunk. LEANN sets no token limit, and Qwen3 accepts up to 32k tokens. A build batch that holds such a chunk pads to that length and runs out of memory. The cap cuts those chunks to 512 tokens instead.
+
+**Tested and not used:** hybrid search with BM25 (vector weight 0.7). Its rankings looked dominated by the BM25 scores, so we did not trust them. Search uses vector scores only (weight 1.0).
+
+## Benchmarks
+
+The test repo is a large private Rails + TypeScript monorepo (about 15k files, 60k chunks).
+
+### Search quality
+
+20 frozen find-the-file questions: 15 about Ruby code, 5 about TypeScript. A hit is the right file in the top 5 results.
+
+| Setup | Right file in top 5 (of 20) | TypeScript (of 5) | MRR |
+|---|---|---|---|
+| Stock LEANN text chunks | 4 | not recorded | not recorded |
+| tree-sitter Ruby AST chunks | 7 | not recorded | not recorded |
+| Prism for Ruby, contriever | 12 | 0 | 0.304 |
+| Prism for Ruby, line windows for other code, Qwen3 with a query instruction (the default) | 17 | 4 | 0.655 |
+
+### Claude Code end to end
+
+35 find-the-file questions. Headless Claude Code (`claude -p`) answered each question once without code_search and once with it. Both sessions had the same model, prompt and built-in tools. Other MCP servers, subagents and hooks were off.
 
 | | Without code_search | With code_search |
 |---|---|---|
-| Median tokens per question | 102k | 88k (14% fewer) |
+| Median tokens per question | 102,051 | 87,652 (14% fewer) |
 | Median time per question | 13.6 s | 12.7 s |
 | Right file in the top 3 answers | 34 of 35 | 34 of 35 |
 | Right file as the first answer | 34 of 35 | 33 of 35 |
 
-- Claude chose to call the tool on 19 of the 35 questions. On those, it saved a median of about 22k tokens per question. On the other 16, the median run used about 1.8k more tokens.
-- The gain is not even across questions. Compared question by question, the median difference is close to zero. The savings come from the questions where Claude used the tool.
+- Claude called the tool in 19 of 35 sessions. On those questions, it saved a median of about 22k tokens.
+- **These questions were easy for grep.** Without the tool, Claude found the right file for 34 of 35. Per question, the median saving was about zero. The 16 sessions that did not call the tool used a median of about 1.8k more tokens.
 - Each question ran once per condition, so treat small differences as noise.
-- Search quality alone, without Claude: with this setup, the right file was in the top 5 results for 17 of 20 questions. With stock LEANN chunking, it was 4 of 20.
-- Results for a set of harder questions are in progress.
+- **In progress:** a hard question set (vocabulary mismatch, concepts, multi-file flows), and a warm server that all sessions share.
 
 ## Run the benchmark on your own repo
 
@@ -205,6 +263,10 @@ cd ~/code-search
 
 Results go to `bench/runs/<timestamp>/` (`summary.json`, plus the full stream of every session), and one row per run goes to `bench/history.jsonl`. Both are gitignored. `bench/run_bench.py --help` lists the conditions and options, including `baseline_hooks`, which prices your own Claude Code hooks.
 
+## Note for LEANN users: tree-sitter 0.26.0
+
+If you use LEANN's AST chunking, do not use tree-sitter 0.26.0. Its Python bindings have a memory bug that makes astchunk segfault on large files. [LEANN PR #453](https://github.com/StarTrail-org/LEANN/pull/453) (open) excludes that version. code-search does not need tree-sitter: its Ruby chunker is Prism, and its lock file has neither tree-sitter nor astchunk.
+
 ## Troubleshooting
 
 - **"No code-search index for ..."**: build one (see Usage).
@@ -216,8 +278,11 @@ Results go to `bench/runs/<timestamp>/` (`summary.json`, plus the full stream of
 
 ## Credits
 
-- [LEANN](https://github.com/StarTrail-org/LEANN): vector index and search (MIT).
+- [LEANN](https://github.com/StarTrail-org/LEANN) ([paper](https://arxiv.org/abs/2506.08276)): the vector index, the builder and searcher API, and the MCP pattern this project follows (MIT).
 - [Prism](https://github.com/ruby/prism): Ruby parser, in Ruby 3.3+ (MIT).
 - [Qwen3-Embedding-0.6B](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B): embedding model (Apache 2.0).
+- [sentence-transformers](https://github.com/huggingface/sentence-transformers): runs the embedding model (Apache 2.0).
 
-License: TBD
+## License
+
+[MIT](LICENSE)
