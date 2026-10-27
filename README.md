@@ -152,6 +152,7 @@ Every Claude Code session starts its own MCP server, but that server does not lo
   ~/code-search/.venv/bin/python ~/code-search/code_search.py status
   ```
 
+- After you update code-search (for example with `git pull`), stop the server. Otherwise it keeps running the old code until its idle exit, or for good under launchd. The next search starts the new code.
 - The shell `search` command uses the same server.
 - The server takes its environment from the session that started it. Set the environment variables below the same way for every session.
 
